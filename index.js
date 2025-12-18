@@ -136,7 +136,6 @@ const normEmail = e => String(e).trim().toLowerCase();
 
 // Get all subscribers (protected endpoint)
 app.get('/_subs', async (req, res) => {
-  // Add authentication check if needed
   try {
     const subs = await Subscriber.find(
       {},
@@ -163,30 +162,38 @@ app.get('/posts', async (req, res) => {
   }
 });
 
-// Subscribe endpoint
+// Subscribe endpoint - FIXED DUPLICATE CHECKING
 app.post('/subscribe', async (req, res) => {
   const email = normEmail(req.body.email || '');
   const name = req.body.name || '';
+  console.log('Subscription attempt:', { email, name });
 
-  if (!email.includes('@') || !email.includes('.')) {
-    return res.status(400).json({ success: false, message: 'Invalid email' });
+  // Validate email format
+  if (!email.includes('@') || !email.includes('.') || email.length < 5) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Invalid email format' 
+    });
   }
-
-  let isNew = false;
 
   try {
-    await Subscriber.create({ email, name });
-    isNew = true;
-  } catch (err) {
-    if (err.code === 11000) {
-      // Duplicate email
-      return res.json({ success: true, message: 'Already subscribed' });
+    // First, check if email already exists
+    const existingSubscriber = await Subscriber.findOne({ email });
+    
+    if (existingSubscriber) {
+      console.log('Email already subscribed:', email);
+      return res.status(200).json({ 
+        success: false, // Changed to false for clarity
+        message: 'This email is already subscribed',
+        alreadySubscribed: true
+      });
     }
-    console.error('Error creating subscriber:', err);
-    return res.status(500).json({ success: false, message: 'Server error' });
-  }
 
-  if (isNew) {
+    // If not exists, create new subscriber
+    await Subscriber.create({ email, name });
+    console.log('New subscriber created:', email);
+
+    // Send welcome email
     const welcomeHtml = `
     <!DOCTYPE html>
     <html>
@@ -219,44 +226,65 @@ app.post('/subscribe', async (req, res) => {
     </html>
     `;
 
-    try {
-      // Send welcome email
-      await safeSend({
-        from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
-        to: email,
-        subject: 'Welcome to our updates',
-        html: welcomeHtml
-      });
+    // Send welcome email (don't await to keep response fast)
+    safeSend({
+      from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
+      to: email,
+      subject: 'Welcome to our updates',
+      html: welcomeHtml
+    }).catch(err => {
+      console.error('Failed to send welcome email:', err.message);
+    });
 
-      // Notify admin
-      const adminHtml = `
-      <!DOCTYPE html>
-      <html>
-      <body style="font-family:Arial,sans-serif;background:#f4f6f8;padding:20px;">
-        <div style="max-width:600px;background:#fff;padding:20px;border-radius:6px;">
-          <h3>New Subscriber</h3>
-          <p><strong>Email:</strong> ${email}</p>
-          <p><strong>Name:</strong> ${name || '-'}</p>
-          <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
-          <p><strong>Total subscribers:</strong> ${await Subscriber.countDocuments()}</p>
-        </div>
-      </body>
-      </html>
-      `;
+    // Notify admin (don't await)
+    const adminHtml = `
+    <!DOCTYPE html>
+    <html>
+    <body style="font-family:Arial,sans-serif;background:#f4f6f8;padding:20px;">
+      <div style="max-width:600px;background:#fff;padding:20px;border-radius:6px;">
+        <h3>New Subscriber</h3>
+        <p><strong>Email:</strong> ${email}</p>
+        <p><strong>Name:</strong> ${name || '-'}</p>
+        <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+        <p><strong>Total subscribers:</strong> ${await Subscriber.countDocuments()}</p>
+      </div>
+    </body>
+    </html>
+    `;
 
-      await safeSend({
-        from: process.env.FROM_EMAIL,
-        to: process.env.ADMIN_EMAIL,
-        subject: 'New Subscriber Joined',
-        html: adminHtml
+    safeSend({
+      from: process.env.FROM_EMAIL,
+      to: process.env.ADMIN_EMAIL,
+      subject: 'New Subscriber Joined',
+      html: adminHtml
+    }).catch(err => {
+      console.error('Failed to send admin notification:', err.message);
+    });
+
+    res.json({ 
+      success: true, 
+      message: 'Subscribed successfully',
+      newSubscriber: true
+    });
+
+  } catch (err) {
+    // Catch any other errors (like network issues during create)
+    console.error('Unexpected error during subscription:', err);
+    
+    // Check if it's a duplicate error that slipped through
+    if (err.code === 11000 || err.message.includes('duplicate')) {
+      return res.status(200).json({ 
+        success: false, 
+        message: 'This email is already subscribed',
+        alreadySubscribed: true
       });
-    } catch (emailError) {
-      console.error('Error sending welcome emails:', emailError);
-      // Don't fail the subscription if email fails
     }
+    
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error. Please try again later.'
+    });
   }
-
-  res.json({ success: true, message: 'Subscribed successfully' });
 });
 
 // Publish endpoint
@@ -477,6 +505,47 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
   }
 });
 
+// Check if email is subscribed
+app.post('/check-subscription', async (req, res) => {
+  const email = normEmail(req.body.email || '');
+  
+  if (!email.includes('@') || !email.includes('.') || email.length < 5) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Invalid email format' 
+    });
+  }
+
+  try {
+    const existingSubscriber = await Subscriber.findOne({ email });
+    
+    if (existingSubscriber) {
+      return res.json({ 
+        success: true,
+        subscribed: true,
+        message: 'Email is already subscribed',
+        data: {
+          email: existingSubscriber.email,
+          name: existingSubscriber.name,
+          subscribedSince: existingSubscriber.createdAt
+        }
+      });
+    } else {
+      return res.json({ 
+        success: true,
+        subscribed: false,
+        message: 'Email is not subscribed'
+      });
+    }
+  } catch (err) {
+    console.error('Error checking subscription:', err);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Server error. Please try again later.'
+    });
+  }
+});
+
 // Unsubscribe endpoint
 app.post('/unsubscribe', async (req, res) => {
   try {
@@ -484,10 +553,18 @@ app.post('/unsubscribe', async (req, res) => {
     const result = await Subscriber.deleteOne({ email: email });
     
     if (result.deletedCount === 0) {
-      return res.json({ success: true, message: 'Email was not subscribed' });
+      return res.json({ 
+        success: true, 
+        message: 'Email was not subscribed',
+        alreadyUnsubscribed: true
+      });
     }
     
-    res.json({ success: true, message: 'Unsubscribed successfully' });
+    res.json({ 
+      success: true, 
+      message: 'Unsubscribed successfully',
+      unsubscribed: true
+    });
   } catch (err) {
     console.error('Unsubscribe error:', err);
     res.status(500).json({ success: false, message: 'Server error' });
@@ -559,6 +636,7 @@ app.get('/', (req, res) => {
     version: '1.0.0',
     endpoints: {
       subscribe: 'POST /subscribe',
+      checkSubscription: 'POST /check-subscription',
       publish: 'POST /publish',
       posts: 'GET /posts',
       unsubscribe: 'POST /unsubscribe',
