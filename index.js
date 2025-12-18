@@ -14,28 +14,10 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 
-
-let db;
-let smtp;
-
-
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-// Configure multer for file uploads
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, uniqueSuffix + '-' + file.originalname);
-  }
-});
-
-const upload = multer({ 
-  storage: storage,
-  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
-});
+// Ensure upload directory exists
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
 
 // Validate required environment variables
 const required = [
@@ -45,8 +27,7 @@ const required = [
   'EMAIL_USER',
   'EMAIL_PASS',
   'ADMIN_EMAIL',
-  'PUBLISH_SECRET',
-  'TEMP'
+  'PUBLISH_SECRET'
 ];
 
 for (const k of required) {
@@ -56,13 +37,31 @@ for (const k of required) {
   }
 }
 
+// Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, UPLOAD_DIR);
+  },
+  filename: function (req, file, cb) {
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    // Remove special characters from filename
+    const safeName = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
+    cb(null, uniqueSuffix + '-' + safeName);
+  }
+});
+
+const upload = multer({ 
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 } // 10MB
+});
+
 // MongoDB connection
 mongoose.connect(process.env.MONGODB_URI)
-  .then(() => console.log('MongoDB connected'),
-   db='DB connection established.'
-)
+  .then(() => {
+    console.log('MongoDB connected');
+  })
   .catch(err => {
-    console.error(err.message);
+    console.error('MongoDB connection error:', err.message);
     process.exit(1);
   });
 
@@ -97,7 +96,8 @@ app.use('/uploads', express.static(UPLOAD_DIR));
 // Rate limiting
 app.use('/subscribe', rateLimit({
   windowMs: 60000,
-  max: 12
+  max: 12,
+  message: { success: false, message: 'Too many subscription requests' }
 }));
 
 // Email transporter
@@ -110,15 +110,13 @@ const transporter = nodemailer.createTransport({
 });
 
 // Verify SMTP connection
-(async () => {
-  try {
-    await transporter.verify();
+transporter.verify()
+  .then(() => {
     console.log('SMTP ready');
-    smtp='SMTP connection established.'
-  } catch (e) {
-    console.error('SMTP connection error:', e.message);
-  }
-})();
+  })
+  .catch(err => {
+    console.error('SMTP connection error:', err.message);
+  });
 
 // Helper function to send emails
 async function safeSend(mail) {
@@ -136,9 +134,9 @@ const normEmail = e => String(e).trim().toLowerCase();
 
 // Routes
 
-
-// Get all subscribers
+// Get all subscribers (protected endpoint)
 app.get('/_subs', async (req, res) => {
+  // Add authentication check if needed
   try {
     const subs = await Subscriber.find(
       {},
@@ -170,7 +168,7 @@ app.post('/subscribe', async (req, res) => {
   const email = normEmail(req.body.email || '');
   const name = req.body.name || '';
 
-  if (!email.includes('@')) {
+  if (!email.includes('@') || !email.includes('.')) {
     return res.status(400).json({ success: false, message: 'Invalid email' });
   }
 
@@ -201,7 +199,7 @@ app.post('/subscribe', async (req, res) => {
                 <td>
                   <h2 style="color:#222;">Welcome, ${name || 'there'} 👋</h2>
                   <p style="color:#444;font-size:15px;line-height:1.6;">
-                    Thanks for subscribing to <strong>${process.env.EMAIL_USER}</strong>.
+                    Thanks for subscribing to <strong>${process.env.FROM_NAME}</strong>.
                   </p>
                   <p style="color:#444;font-size:15px;line-height:1.6;">
                     You'll receive updates whenever we publish something new.
@@ -221,36 +219,41 @@ app.post('/subscribe', async (req, res) => {
     </html>
     `;
 
-    // Send welcome email
-    await safeSend({
-      from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
-      to: email,
-      subject: 'Welcome to our updates',
-      html: welcomeHtml
-    });
+    try {
+      // Send welcome email
+      await safeSend({
+        from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
+        to: email,
+        subject: 'Welcome to our updates',
+        html: welcomeHtml
+      });
 
-    // Notify admin
-    const adminHtml = `
-    <!DOCTYPE html>
-    <html>
-    <body style="font-family:Arial,sans-serif;background:#f4f6f8;padding:20px;">
-      <div style="max-width:600px;background:#fff;padding:20px;border-radius:6px;">
-        <h3>New Subscriber</h3>
-        <p><strong>Email:</strong> ${email}</p>
-        <p><strong>Name:</strong> ${name || '-'}</p>
-        <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
-        <p><strong>Total subscribers:</strong> ${await Subscriber.countDocuments()}</p>
-      </div>
-    </body>
-    </html>
-    `;
+      // Notify admin
+      const adminHtml = `
+      <!DOCTYPE html>
+      <html>
+      <body style="font-family:Arial,sans-serif;background:#f4f6f8;padding:20px;">
+        <div style="max-width:600px;background:#fff;padding:20px;border-radius:6px;">
+          <h3>New Subscriber</h3>
+          <p><strong>Email:</strong> ${email}</p>
+          <p><strong>Name:</strong> ${name || '-'}</p>
+          <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
+          <p><strong>Total subscribers:</strong> ${await Subscriber.countDocuments()}</p>
+        </div>
+      </body>
+      </html>
+      `;
 
-    await safeSend({
-      from: process.env.FROM_EMAIL,
-      to: process.env.ADMIN_EMAIL,
-      subject: 'New Subscriber Joined',
-      html: adminHtml
-    });
+      await safeSend({
+        from: process.env.FROM_EMAIL,
+        to: process.env.ADMIN_EMAIL,
+        subject: 'New Subscriber Joined',
+        html: adminHtml
+      });
+    } catch (emailError) {
+      console.error('Error sending welcome emails:', emailError);
+      // Don't fail the subscription if email fails
+    }
   }
 
   res.json({ success: true, message: 'Subscribed successfully' });
@@ -260,7 +263,8 @@ app.post('/subscribe', async (req, res) => {
 app.post('/publish', upload.single('attachment'), async (req, res) => {
   try {
     // Check secret
-    if (req.headers['x-publish-secret'] !== process.env.PUBLISH_SECRET) {
+    const secret = req.headers['x-publish-secret'] || req.body.secret;
+    if (secret !== process.env.PUBLISH_SECRET) {
       return res.status(401).json({ success: false, message: 'Invalid secret' });
     }
 
@@ -278,7 +282,9 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
     let attachmentName = null;
     
     if (req.file) {
-      attachmentUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+      const protocol = req.protocol;
+      const host = req.get('host');
+      attachmentUrl = `${protocol}://${host}/uploads/${req.file.filename}`;
       attachmentName = req.file.originalname;
     }
 
@@ -290,15 +296,16 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
       postUrl,
       attachmentUrl,
       attachmentName,
-      sendFull: sendFull === '1',
+      sendFull: sendFull === '1' || sendFull === 'true',
       publishedAt: new Date()
     });
 
     // Prepare email content
-    const emailBody = sendFull === '1' ? (content || excerpt || '') : (excerpt || '');
+    const emailBody = (sendFull === '1' || sendFull === 'true') ? (content || excerpt || '') : (excerpt || '');
     
     // Send emails to all subscribers
     let sentCount = 0;
+    const failedEmails = [];
     
     for (const subscriber of subs) {
       const unsubscribeLink = `${req.protocol}://${req.get('host')}/unsubscribe?email=${encodeURIComponent(subscriber.email)}`;
@@ -337,7 +344,7 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
                 ${emailBody}
               </div>
 
-              ${sendFull !== '1' && excerpt && content ? 
+              ${(sendFull !== '1' && sendFull !== 'true') && excerpt && content ? 
                 `<div style="margin:20px 0;padding:15px;background:#f8f9fa;border-radius:8px;">
                   <p style="margin:0;font-style:italic;">Full article available at the link below...</p>
                 </div>` : ''
@@ -392,22 +399,27 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
         from: `"${process.env.FROM_NAME}" <${process.env.FROM_EMAIL}>`,
         to: subscriber.email,
         subject: title,
-        html: publishHtml
-      };
-
-      // Add attachment if exists
-      if (req.file) {
-        mailOptions.attachments = [{
+        html: publishHtml,
+        attachments: req.file ? [{
           filename: req.file.originalname,
           path: req.file.path
-        }];
-      }
+        }] : []
+      };
 
-      const ok = await safeSend(mailOptions);
-      if (ok) sentCount++;
+      try {
+        const ok = await safeSend(mailOptions);
+        if (ok) {
+          sentCount++;
+        } else {
+          failedEmails.push(subscriber.email);
+        }
+      } catch (sendError) {
+        console.error(`Error sending to ${subscriber.email}:`, sendError.message);
+        failedEmails.push(subscriber.email);
+      }
       
       // Small delay between emails to avoid rate limiting
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 100));
     }
 
     // Notify admin about publication
@@ -419,10 +431,12 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
         <h3>Post Published Successfully</h3>
         <p><strong>Title:</strong> ${title}</p>
         <p><strong>Sent to:</strong> ${sentCount} subscribers</p>
+        <p><strong>Failed to send:</strong> ${failedEmails.length}</p>
         <p><strong>Total subscribers:</strong> ${subs.length}</p>
         <p><strong>Time:</strong> ${new Date().toLocaleString()}</p>
         ${attachmentUrl ? `<p><strong>Attachment:</strong> ${attachmentName} (${attachmentUrl})</p>` : ''}
         <p><strong>Post URL:</strong> ${postUrl}</p>
+        ${failedEmails.length > 0 ? `<p><strong>Failed emails:</strong> ${failedEmails.join(', ')}</p>` : ''}
       </div>
     </body>
     </html>
@@ -435,16 +449,31 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
       html: adminHtml
     });
 
-    res.json({ 
+    const response = { 
       success: true, 
-      sent: { subscribers: sentCount },
+      sent: { 
+        subscribers: sentCount,
+        total: subs.length,
+        failed: failedEmails.length
+      },
+      postId: post._id,
       attachmentUrl: attachmentUrl,
-      message: `Published successfully to ${sentCount} subscribers`
-    });
+      message: `Published successfully to ${sentCount} out of ${subs.length} subscribers`
+    };
+
+    if (failedEmails.length > 0) {
+      response.failedEmails = failedEmails;
+    }
+
+    res.json(response);
 
   } catch (error) {
     console.error('Publish error:', error);
-    res.status(500).json({ success: false, message: 'Internal server error' });
+    res.status(500).json({ 
+      success: false, 
+      message: 'Internal server error',
+      error: error.message 
+    });
   }
 });
 
@@ -452,7 +481,12 @@ app.post('/publish', upload.single('attachment'), async (req, res) => {
 app.post('/unsubscribe', async (req, res) => {
   try {
     const email = normEmail(req.body.email || '');
-    await Subscriber.deleteOne({ email: email });
+    const result = await Subscriber.deleteOne({ email: email });
+    
+    if (result.deletedCount === 0) {
+      return res.json({ success: true, message: 'Email was not subscribed' });
+    }
+    
     res.json({ success: true, message: 'Unsubscribed successfully' });
   } catch (err) {
     console.error('Unsubscribe error:', err);
@@ -468,26 +502,115 @@ app.get('/unsubscribe', async (req, res) => {
   }
   
   try {
-    await Subscriber.deleteOne({ email: normEmail(email) });
-    res.send(`
+    const result = await Subscriber.deleteOne({ email: normEmail(email) });
+    
+    let htmlResponse = '';
+    if (result.deletedCount > 0) {
+      htmlResponse = `
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 40px; text-align: center;">
+            <h2>Successfully Unsubscribed</h2>
+            <p>You have been unsubscribed from ${process.env.FROM_NAME} newsletters.</p>
+            <p>You will no longer receive emails from us.</p>
+          </body>
+        </html>
+      `;
+    } else {
+      htmlResponse = `
+        <html>
+          <body style="font-family: Arial, sans-serif; padding: 40px; text-align: center;">
+            <h2>Already Unsubscribed</h2>
+            <p>This email was not found in our subscriber list.</p>
+            <p>You will not receive emails from ${process.env.FROM_NAME}.</p>
+          </body>
+        </html>
+      `;
+    }
+    
+    res.send(htmlResponse);
+  } catch (err) {
+    console.error('Unsubscribe error:', err);
+    res.status(500).send(`
       <html>
         <body style="font-family: Arial, sans-serif; padding: 40px; text-align: center;">
-          <h2>Successfully Unsubscribed</h2>
-          <p>You have been unsubscribed from ${process.env.FROM_NAME} newsletters.</p>
-          <p>You will no longer receive emails from us.</p>
+          <h2>Error</h2>
+          <p>There was an error processing your unsubscribe request.</p>
+          <p>Please try again later or contact support.</p>
         </body>
       </html>
     `);
-  } catch (err) {
-    res.status(500).send('Error processing unsubscribe request');
   }
 });
 
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'Newsletter API'
+  });
+});
 
-app.get('/', (_, res) => res.json({ ok: true }));
+// Root endpoint
+app.get('/', (req, res) => {
+  res.json({ 
+    ok: true,
+    service: 'Newsletter API',
+    version: '1.0.0',
+    endpoints: {
+      subscribe: 'POST /subscribe',
+      publish: 'POST /publish',
+      posts: 'GET /posts',
+      unsubscribe: 'POST /unsubscribe',
+      health: 'GET /health'
+    }
+  });
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ 
+    success: false, 
+    message: 'Internal server error',
+    error: process.env.NODE_ENV === 'development' ? err.message : undefined
+  });
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({ 
+    success: false, 
+    message: 'Endpoint not found' 
+  });
+});
 
 // Start server
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Upload directory: ${UPLOAD_DIR}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed.');
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed.');
+      process.exit(0);
+    });
+  });
+});
+
+process.on('SIGINT', () => {
+  console.log('SIGINT received. Shutting down gracefully...');
+  server.close(() => {
+    console.log('Server closed.');
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed.');
+      process.exit(0);
+    });
+  });
 });
